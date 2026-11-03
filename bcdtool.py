@@ -12,6 +12,9 @@ Safety model:
   * The hive is committed and closed before atomic replacement.
   * The original is not replaced if parsing or mutation fails.
   * Device descriptors remain opaque unless supplied as raw:HEX.
+
+Compatibility:
+  * Some python-hivex builds expose no Hivex.close(); safe_close() handles both.
 """
 from __future__ import annotations
 
@@ -25,7 +28,7 @@ import sys
 import tempfile
 import uuid
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable
 
 try:
     import hivex
@@ -41,7 +44,6 @@ REG_DWORD = 4
 REG_SZ = 1
 REG_MULTI_SZ = 7
 
-# Friendly names used by BCDEdit and names confirmed in common BCD type tables.
 BUILTIN_ELEMENTS: dict[int, str] = {
     # Library
     0x11000001: "device",
@@ -123,10 +125,9 @@ BUILTIN_ELEMENTS: dict[int, str] = {
     0x250000C2: "bootmenupolicy",
     0x250000F0: "hypervisorlaunchtype",
     0x220000F1: "hypervisorpath",
-    # Common OEM/custom entries in the supplied WP8 BCD
+    # Common OEM/custom entries
     0x54000001: "custom:54000001",
     0x54000002: "custom:54000002",
-    0x250000C2: "bootmenupolicy",
     0x26000201: "custom:26000201",
     0x26000206: "custom:26000206",
     0x250000E0: "custom:250000e0",
@@ -144,8 +145,6 @@ BUILTIN_ELEMENTS: dict[int, str] = {
     0x1600007A: "custom:1600007a",
 }
 
-# Application-specific aliases. These intentionally override collisions in the
-# global friendly-name table only when the object category is known.
 APP_ELEMENTS = {
     "bootmgr": {
         0x24000001: "displayorder", 0x24000002: "bootsequence",
@@ -217,6 +216,23 @@ def die(message: str):
     raise BcdError(message)
 
 
+def safe_close(h):
+    """Close a Hivex handle if the binding exposes close().
+
+    Some python-hivex builds have no Hivex.close(); the C handle is then
+    released by the object's destructor. We must never fail on close().
+    """
+    if h is None:
+        return
+    close_fn = getattr(h, "close", None)
+    if close_fn is None:
+        return
+    try:
+        close_fn()
+    except Exception:
+        pass
+
+
 def norm_guid(value: str) -> str:
     s = value.strip().strip("{}")
     try:
@@ -227,10 +243,6 @@ def norm_guid(value: str) -> str:
 
 def guid_bytes(value: str) -> bytes:
     return uuid.UUID(norm_guid(value).strip("{}")).bytes_le
-
-
-def type_parts(value: int) -> tuple[int, int, int]:
-    return ((value >> 28) & 0xF, (value >> 24) & 0xF, value & 0xFFFFFF)
 
 
 def parse_type_token(token: str, object_alias: str | None = None) -> int:
@@ -274,8 +286,6 @@ def load_symbols(script_dir: Path):
         if not name.startswith("custom:"):
             NAME_TO_TYPE[name.lower()] = typ
 
-    # The upstream known_symbols file is optional. Load all populated names,
-    # not just the first alias column; numeric IDs remain authoritative.
     path = script_dir / "known_symbols.json"
     if path.exists():
         try:
@@ -298,7 +308,6 @@ def load_symbols(script_dir: Path):
         except Exception as exc:
             print(f"bcdtool: warning: cannot load {path.name}: {exc}", file=sys.stderr)
 
-    # Explicitly enforce known Boot Manager aliases even if upstream data lacks them.
     NAME_TO_TYPE["customactions"] = 0x27000030
     TYPE_TO_NAME[0x27000030] = "customactions"
 
@@ -348,17 +357,6 @@ def raw_value(h, node, name="Element"):
 
 def set_reg(h, node, name: str, regtype: int, data):
     h.node_set_value(node, {"key": name, "t": regtype, "value": data})
-
-
-def del_reg_value(h, node, name: str):
-    keep = []
-    for vh in h.node_values(node):
-        key = h.value_key(vh)
-        if key.casefold() == name.casefold():
-            continue
-        regtype, data = h.value_value(vh)
-        keep.append({"key": key, "t": regtype, "value": data})
-    h.node_set_values(node, keep)
 
 
 def object_type(h, obj) -> int:
@@ -419,7 +417,6 @@ def resolve_id(h, objects, ident: str) -> str:
                         pass
         die("Cannot resolve {default}: Boot Manager default element is missing or malformed.")
     if low == "current":
-        # Current is a well-known alias but may not exist in an offline store.
         for g, name in OBJECT_GUIDS.items():
             if name == "current":
                 return "{" + g + "}"
@@ -434,7 +431,6 @@ def resolve_id(h, objects, ident: str) -> str:
 def decode_object(data: bytes) -> str:
     if len(data) == 16:
         return "{" + str(uuid.UUID(bytes_le=data)).upper() + "}"
-    # BCD documentation describes Object as a GUID in string form.
     text = decode_utf16_text(data)
     match = GUID_RE.search(text)
     if match:
@@ -447,20 +443,11 @@ def decode_utf16_text(data: bytes) -> str:
 
 
 def decode_object_list(data: bytes) -> tuple[list[str], str]:
-    """Decode both observed BCD hive encodings without losing the raw bytes.
-
-    Native BCD element APIs expose ObjectList as GUID arrays. Hive payloads seen
-    in the field may also be UTF-16 GUID strings / MULTI_SZ-like sequences.
-    The textual form is selected only when the payload contains valid GUID
-    strings and no unexplained non-zero characters.
-    """
-    # Textual GUID representation (single string or NUL-separated strings).
     try:
         text = data.decode("utf-16le").rstrip("\x00")
         candidates = [x.strip() for x in text.split("\x00") if x.strip()]
         if candidates and all(GUID_RE.fullmatch(x) for x in candidates):
             return [norm_guid(x) for x in candidates], "utf16"
-        # Some stores have contiguous textual GUIDs without a NUL between them.
         found = GUID_RE.findall(text)
         residue = GUID_RE.sub("", text).replace("\x00", "").strip()
         if found and not residue:
@@ -479,7 +466,6 @@ def decode_object_list(data: bytes) -> tuple[list[str], str]:
 def encode_object_list(items: list[str], encoding: str = "binary") -> bytes:
     ids = [norm_guid(x) for x in items]
     if encoding == "utf16":
-        # NUL-separated GUID strings with a final NUL (REG_MULTI_SZ-like data).
         return ("\x00".join(ids) + "\x00\x00").encode("utf-16le")
     return b"".join(guid_bytes(x) for x in ids)
 
@@ -551,7 +537,6 @@ def object_dump(h, guid: str, obj, verbose=False):
 
 
 def object_kind(typ: int) -> tuple[int, int, int]:
-    # BCD object type: class nibble, image nibble, application subtype.
     return ((typ >> 28) & 0xF, (typ >> 20) & 0xF, typ & 0xFFFFF)
 
 
@@ -611,7 +596,6 @@ def parse_element_value(h, obj, typ: int, value: str, existing_data: bytes | Non
         return value.encode("utf-16le") + b"\x00\x00"
     if fmt == 3:
         ident = resolve_id(h, all_objects(h), value)
-        # Match the observed on-disk textual GUID encoding when possible.
         if existing_data is not None:
             try:
                 decode_object(existing_data)
@@ -622,8 +606,6 @@ def parse_element_value(h, obj, typ: int, value: str, existing_data: bytes | Non
         return guid_bytes(ident)
     if fmt == 4:
         items = [x.strip() for x in value.split(",") if x.strip()]
-        # ObjectList values are GUID-string arrays in the BCD hive. Preserve
-        # a packed GUID array only if the existing payload was unambiguously binary.
         encoding = "utf16"
         if existing_data is not None:
             try:
@@ -680,6 +662,7 @@ def mutate_store(path: str | Path, operation: Callable):
         )
     fd, tmp = tempfile.mkstemp(prefix=path.name + ".bcdtool.", dir=str(parent))
     os.close(fd)
+    hive = None
     try:
         shutil.copy2(path, tmp)
         hive = hivex.Hivex(tmp, write=True)
@@ -687,10 +670,8 @@ def mutate_store(path: str | Path, operation: Callable):
             operation(hive)
             hive.commit(None)
         finally:
-            try:
-                hive.close()
-            except Exception:
-                pass
+            safe_close(hive)
+            hive = None
         os.replace(tmp, path)
     except PermissionError as exc:
         try:
@@ -774,7 +755,7 @@ def cmd_enum(store, args, verbose):
     try:
         enum_objects(h, selector, verbose)
     finally:
-        h.close()
+        safe_close(h)
 
 
 def cmd_set(store, args):
@@ -795,7 +776,7 @@ def cmd_set(store, args):
                 existing = raw_value(h, en)
         data = parse_element_value(h, obj, typ, value, existing)
     finally:
-        h.close()
+        safe_close(h)
     mutate_store(store, lambda w: write_element(w, ident, typ, data))
     print("The operation completed successfully.")
 
@@ -808,7 +789,7 @@ def cmd_deletevalue(store, args):
         ident = resolve_id(h, all_objects(h), args[0])
         typ = parse_type_token(args[1], object_alias(ident))
     finally:
-        h.close()
+        safe_close(h)
     mutate_store(store, lambda w: delete_element(w, ident, typ))
     print("The operation completed successfully.")
 
@@ -820,7 +801,7 @@ def cmd_delete(store, args):
     try:
         ident = resolve_id(h, all_objects(h), args[0])
     finally:
-        h.close()
+        safe_close(h)
     if ident == BOOTMGR:
         die("Refusing to delete the Windows Boot Manager object.")
     def op(w):
@@ -845,7 +826,7 @@ def cmd_copy(store, args):
         src = resolve_id(h, all_objects(h), src_arg)
         typ = object_type(h, child(h, objects_node(h), src))
     finally:
-        h.close()
+        safe_close(h)
     new_id = "{" + str(uuid.uuid4()).upper() + "}"
     def op(w):
         root = objects_node(w)
@@ -862,9 +843,6 @@ def cmd_copy(store, args):
 
 
 def cmd_create(store, args):
-    # Supported forms:
-    # /create /d "description" /application osloader
-    # /create /d "description" /inherit {GUID}
     lower = [x.lower() for x in args]
     desc = None
     if "/d" in lower:
@@ -881,7 +859,6 @@ def cmd_create(store, args):
         i = lower.index("/inherit")
         if i + 1 >= len(args):
             die("/create /inherit requires an inherited-object type.")
-        # BCD inherited object type uses class 2 and the low 28 bits of source.
         source = args[i + 1].lower()
         if source in ("bootloadersettings", "osloader", "library"):
             objtype = 0x20200000
@@ -926,7 +903,7 @@ def cmd_order(store, object_id: str, typ: int, ids: list[str], mode: str = "repl
         else:
             encoding = "binary"
     finally:
-        h.close()
+        safe_close(h)
     if mode == "replace":
         result = resolved
     elif mode == "addfirst":
@@ -976,7 +953,6 @@ def cmd_timeout(store, args):
 
 
 def normalize_argv(argv: list[str]) -> tuple[list[str], bool]:
-    """Accept BCDEdit-style slash options, including /v after the command."""
     out = []
     verbose = False
     for item in argv:
@@ -1004,7 +980,8 @@ def main(argv=None) -> int:
         description="Offline BCD store editor (Python + libhivex; BCDEdit-style syntax).",
     )
     parser.add_argument("--store", required=True, help="BCD hive path (BCDEdit /store)")
-    parser.add_argument("--verbose", action="store_true", default=slash_verbose, help="BCDEdit /v: show full object GUIDs and numeric element IDs")
+    parser.add_argument("--verbose", action="store_true", default=slash_verbose,
+                        help="BCDEdit /v: show full object GUIDs and numeric element IDs")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     ns = parser.parse_args(raw)
 
